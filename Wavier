@@ -1,0 +1,296 @@
+import sys
+import numpy as np
+import chunk
+import struct
+import audioop
+
+# little endian
+LE_PREFIX = '<' # this is for RIFF
+# big endian
+BE_PREFIX = '>' # this is for RIFX
+
+depthFMTChar = (None, 'B','h',None,'l')
+
+#This currently has callouts to exception handling used in the sampler software
+# would need some modifications to run without an exceptionWarning method
+
+class wavier:
+
+    def __init__(self):
+        self.infosize = []
+        self.info = []
+        self.isfloat = []
+        self.sampleRate = []
+        self.sampleWidth = []
+        self.bitsPSample = []
+        self.channels = []
+        self.data =[]
+        self.decoded = []
+
+    def read(self,filename):
+        #shouldnt hit this block with app usage
+        if type(filename) != str:
+            exceptionWarning('oops, its not even supposed to be possible to get here. \n \n please contact support@bestsamplerever.ca to resolve the issue')
+            raise Exception("just pass in the file name string nothing fancy")
+        try:
+            openFile = open(filename, 'rb')
+        except FileNotFoundError:
+            exceptionWarning('oops, its not even supposed to be possible to get here. \n \n please contact support@bestsamplerever.ca to resolve the issue')
+            raise Exception("Couldn't find your file. Looking in the right directory?")
+
+        fileLabel = openFile.read(4) #should be RIFF
+        if fileLabel != b'RIFF':
+            if fileLabel == b'RIFX':
+                global rifxFlag
+                global conversionFailed
+                rifxFlag =1
+                conversionFailed += 'file '+ filename + 'failed to convert. reason: RIFX file \n'
+                exceptionWarning('no RIFX support at this time \n If you did not intend to select an RIFX file your .wav file may be corrupted \n \n program will now exit')
+                raise Exception("no RIFX support at this time")
+            else:
+                #this is probably how to handle excpetions. get exception warning to restart program?
+                exceptionWarning('Unrecognized file label!! '
+                                 + '\n \n Please contact support@bestsamplerever.ca to resolve the issue' +
+                                 '\n \n Program will now exit')
+                raise Exception("unrecognized file label (not RIFF or RIFX)- possible corruption")
+        fileSize = openFile.read(4)
+        debug = struct.unpack('<L',fileSize)
+        fileType = openFile.read(4) # should just read wave
+
+        #Get info chunk
+        while True:
+            try:
+                infoChunk = chunk.Chunk(openFile, bigendian=False)
+            except EOFError:
+                exceptionWarning('wave file corrupted, could not find data before end of file'
+                                 '\n \n Program will now exit')
+                raise Exception("wave file corrupted, could not find data before end of file")
+            name = infoChunk.getname()
+            # found format
+            if name == b'fmt ':# or name == b'bext':
+                break
+            infoChunk.skip()
+
+
+        #this gets all the data unpacked from fmt chunk
+        self.infosize = infoChunk.getsize() #should be 16 for PCM
+        self.info = struct.unpack_from('HHLLHH',infoChunk.read(infoChunk.getsize()))
+        self.isfloat = int(self.info[0])
+        self.sampleRate = int(self.info[2])
+        self.sampleWidth = int(self.info[5] / 8)
+        self.bitsPSample = int(self.info[5]) #this is bits for a single channel, not an entire frame
+        self.channels = int(self.info[1])
+        # iterate through chunks until data chunk obtained
+        # should immediately follow fmt chunk
+        while True:
+            try:
+                dataChunk = chunk.Chunk(openFile, bigendian=False)
+            except EOFError:
+                exceptionWarning('wave file corrupted, could not find data before end of file'
+                                 '\n \n Program will now exit')
+                raise Exception("wave file corrupted, could not find data before end of file")
+            name = dataChunk.getname()
+            # found format
+            if name == b'data':
+                break
+            dataChunk.skip()
+        databyteSize = dataChunk.getsize()
+        self.data = dataChunk.read(databyteSize)
+        self.n_frames = int(databyteSize/(self.sampleWidth*self.channels))
+        self.decoded = self.decode()
+
+    def decode(self):
+        # send the data here to decode from packed bytes to bit values
+        #check for float or bytes - either PCM or float
+        if self.isfloat == 3:
+            decoded = self.decodeFloat()
+        elif self.sampleWidth == 3:
+            decoded =self.decodeTwoFour()
+        else:
+            decoded =self.decodePCM()
+
+        if (self.channels != 1) and self.channels != 2:
+            print("Does not support greater than 2 channel audio")
+
+        decodedList = np.empty([self.n_frames, 2], dtype=int)
+        #decodedList = []
+        i = 0
+        for tup in decoded:
+            if self.channels ==2:
+                decodedList[i, :] = [tup[0], tup[1]]
+            else:
+                decodedList[i, :] = [tup[0], tup[0]]
+
+            i = i + 1
+        self.decoded = decodedList # TODO: remove this if not required
+        return decodedList
+
+    def getFrames(self):
+        frames = []
+        bytesPerFrame = self.sampleWidth * self.channels
+        for i in range(0, self.n_frames * bytesPerFrame - (bytesPerFrame-1), bytesPerFrame):
+            frames.append(self.data[i:i+bytesPerFrame])
+        self.frames = frames
+        return frames
+
+    def decodeFloat(self):
+
+        fmt = LE_PREFIX + self.channels * 'f'
+        bytesPerFrame = self.sampleWidth * self.channels
+        decoded = []
+        kmOne=[]
+        for i in range(0, self.n_frames * bytesPerFrame - (bytesPerFrame-1), bytesPerFrame):
+            k = struct.unpack(fmt, self.data[i:i+bytesPerFrame])
+            if abs(k[0])>5 or abs(k[1])>5:
+                decoded.append(kmOne)
+            else:
+                decoded.append(k)
+                kmOne = k
+        maxDebug = max(decoded)
+        minDebug = min(decoded)
+        debugNP = np.array(decoded)
+        maxVal = max(abs(debugNP.min()), debugNP.max(), key=abs)
+
+        if maxVal>1:
+            decoded = [[(x/maxVal) for x in de] for de in decoded]
+            print("your audio is clipping on 16bits, autoscaling....")
+        #scaling down a little bit to account for some math precision whoopsies
+        # cant exceed 32767 for 16bit
+        scaleFactor = 2 ** (self.sampleWidth * 8)/2 - 60 #20 accounts for some weird rounding errors
+        #should result in PCM file of origional bit depth
+        #will look like zeros at the start if converting to 16 bit
+        decoded = [[int(x*scaleFactor)for x in de] for de in decoded] # scale to whatever bit depth it was at 32750
+        self.decoded = decoded
+        self.data = self.encode3or4byte()
+        return decoded
+
+    def decodePCM(self):
+        decoded=[]
+        fmt = LE_PREFIX+self.channels*depthFMTChar[self.sampleWidth]
+        bytesPerFrame = self.sampleWidth * self.channels
+        for i in range(0, self.n_frames * bytesPerFrame - (bytesPerFrame-1), bytesPerFrame):
+            decoded.append(struct.unpack(fmt, self.data[i:i+bytesPerFrame]))
+        return decoded
+
+    def decodeTwoFour(self):
+        f = np.empty((self.n_frames, 2, 4), dtype=np.uint8)
+        framebytes = np.frombuffer(self.data, dtype=np.uint8)
+        f[:, :, :self.sampleWidth] = framebytes.reshape(-1, self.channels, self.sampleWidth)
+        # this convertes the 24 bit values to full range 32 bit
+        # padding with 1's if its negative, pad with 0's if positive
+        f[:, :, self.sampleWidth:] = ((f[:, :, self.sampleWidth - 1:self.sampleWidth]) >> (7)) * 255
+        decoded = f.view('<i4').reshape(f.shape[:-1])
+
+
+        return decoded
+
+    def encodeDefault(self):
+        encoded = b''
+        dataToPack = self.decoded
+
+        if self.channels == 1:
+            fmt = "<h"  # read signed 2 byte data - mono
+        elif self.channels == 2:
+            fmt = "<hh"  # read signed 2 byte data - stereo
+        # fastData = np.empty((self.n_frames*self.channels,1),int)
+        # i=0
+        # for pair in dataToPack:
+        #     fastData[2*i:2*i+2,0] =(pair[:])
+        #     i=i+1
+        # fastData = fastData.tolist()
+        fastData = []
+        for frame in dataToPack:
+            fastData.append(frame[0])
+            fastData.append(frame[1])
+        wut = (fastData[3])
+        # for x in range(len(fastData)):
+        #     fastData[i]=int(fastData[i])
+
+        encoded = struct.pack('<'+'h'*len(fastData), *fastData)
+
+        return encoded
+
+    def encode3or4byte(self):
+        encoded = b''
+        dataToPack = self.decoded
+        fmt =  depthFMTChar[self.sampleWidth]
+        fastData = []
+        for frame in dataToPack:
+            for f in frame:
+                fastData.append(f)
+        encoded = struct.pack('<'+fmt*len(fastData), *fastData)
+        self.isfloat =1
+        return encoded
+
+    def byteDepthConvert(self,destBytes, magnitudeReduction):
+        #magnitudeReduction = -6  # value in dB that the audio is lowered
+        linRatio = 10 **(magnitudeReduction/20)
+        #already normalizes to max volume on 16 bit, dont allow people to turn it up more
+        if linRatio >1:
+            linRatio =1
+        Dithering = 1
+        Frames = self.decoded
+        convertedFrames = self.decoded # TODO: this line shouldnt be needed with new volume adjustment
+        if Dithering and self.sampleWidth>destBytes:
+            Frames = self.addDither(destBytes)
+
+        #need to adjust magnitude even if the original audio has the correct byte depth
+        if self.sampleWidth == destBytes:
+            convertedFrames = np.empty([self.n_frames, self.channels], dtype=int)
+            for i in range(0,self.n_frames):
+                for k in range(0,self.channels):
+                    convertedFrames[i,k] = int(Frames[i,k]*linRatio)
+
+        if self.sampleWidth != destBytes:
+            convertedFrames = np.empty([self.n_frames, self.channels], dtype=int)
+            # just gonna convert as ints for now.... something sneaky later if I feel like it
+            byteRatio = (2**(destBytes*8)/2**(self.sampleWidth*8))
+            for i in range(0,self.n_frames):
+                for k in range(0,self.channels):
+                    convertedFrames[i,k] = int(Frames[i,k]*byteRatio*linRatio)
+        return convertedFrames
+
+    def sampleRateConvert(self,newSample,filter):
+        #filter should just be None for now - might put light filter on for downsampling
+        ezpz, newState = audioop.ratecv(self.data, self.sampleWidth, self.channels, self.sampleRate, newSample, filter)
+        ezpz, newState = audioop.ratecv(self.data, self.sampleWidth, self.channels, self.sampleRate, newSample, newState)
+
+        newFrames = int(len(ezpz) / (self.channels * self.sampleWidth))
+        return ezpz, newFrames
+
+    def infoPacker(self):
+        # format of the info chunk'HHLLHH'
+        fmtChunk =b'fmt '+ struct.pack('<L',int(16))+ struct.pack('<H',int(1))+struct.pack('<H',int(self.channels))#mash all the formatting information together here
+        fmtChunk = fmtChunk+struct.pack('<L',int(self.sampleRate))+struct.pack('<L',int(self.sampleRate*self.channels*self.bitsPSample/8))
+        debug = int(self.sampleRate*self.channels*self.bitsPSample/8)
+        fmtChunk = fmtChunk+struct.pack('<H',int(self.channels*self.bitsPSample/8))+struct.pack('<H',int(self.bitsPSample))
+        return fmtChunk
+
+    def waveWrite(self):
+        #just gonna build a wave write in the class
+        # always write as RIFF even if received RIFX
+        title = b'RIFF'
+        fileType = b'WAVE'
+        info = self.infoPacker()
+        fullFile = info+b'data'+struct.pack('<L',int(self.n_frames*self.channels*self.bitsPSample/8)) + self.encodeDefault()
+        fileSize = sys.getsizeof(fullFile)+4
+        debug = struct.pack('<L',fileSize)
+        packedWave = title+struct.pack('<L',fileSize)+fileType+fullFile
+        return packedWave
+
+    def addDither(self, destBytes):
+        # adding triangular shaped noise
+        # amplitude should be two quantization steps
+        currentWidth = self.sampleWidth
+        debug = self.decoded
+        newsignal = np.empty(np.shape(self.decoded))
+        if self.isfloat ==1:
+            quantRatio = ( 2 ** (self.sampleWidth * 8)/2 ** (destBytes * 8))
+        if self.isfloat==3:
+            quantRatio=1/32750
+        for i, frame in enumerate(self.decoded):
+            random = np.random.triangular(-2*quantRatio,0,2*quantRatio)
+            newsignal[i,0] = frame[0]+random
+            newsignal[i,1] = frame[1]+random
+
+        return newsignal
